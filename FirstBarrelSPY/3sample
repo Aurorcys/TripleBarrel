@@ -1,0 +1,299 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+print("=" * 80)
+print("🎯 MULTI-BARREL: BUILDING BARREL 1 - SPY VOLATILITY CRUSHER")
+print("=" * 80)
+
+# ============================================================================
+# 1. DATA DOWNLOAD
+# ============================================================================
+print("\n📥 DOWNLOADING SPY DATA...")
+
+# Get 5 years of daily data
+spy = yf.download('SPY', period='5y', interval='1d', progress=False)
+print(f"✅ Downloaded {len(spy)} days of SPY data")
+
+# Fix MultiIndex columns if they exist
+if isinstance(spy.columns, pd.MultiIndex):
+    print(f"⚠️ Detected MultiIndex columns: {spy.columns.names}")
+    # Keep the original column names - just use the first level
+    spy.columns = spy.columns.get_level_values(0)
+    print(f"✅ Fixed columns: {spy.columns.tolist()}")
+
+# Calculate daily returns
+spy['Return'] = spy['Close'].pct_change()
+spy['Log_Return'] = np.log(spy['Close'] / spy['Close'].shift(1))
+
+# ============================================================================
+# 2. VOLATILITY FEATURES
+# ============================================================================
+print("\n🔧 CALCULATING VOLATILITY FEATURES...")
+
+# 5-day realized volatility (short-term)
+spy['Vol_5d'] = spy['Log_Return'].rolling(5).std() * np.sqrt(252)
+
+# 20-day realized volatility (medium-term)
+spy['Vol_20d'] = spy['Log_Return'].rolling(20).std() * np.sqrt(252)
+
+# Volatility ratio (short/medium)
+spy['Vol_Ratio'] = spy['Vol_5d'] / spy['Vol_20d'].replace(0, 0.001)
+
+# Bollinger Band width (another volatility measure) - FIXED
+rolling_mean = spy['Close'].rolling(20).mean()
+rolling_std = spy['Close'].rolling(20).std()
+
+spy['BB_Upper'] = rolling_mean + (rolling_std * 2)
+spy['BB_Lower'] = rolling_mean - (rolling_std * 2)
+spy['BB_Width'] = (spy['BB_Upper'] - spy['BB_Lower']) / rolling_mean
+
+# ATR (Average True Range) for volatility
+spy['TR'] = np.maximum(
+    spy['High'] - spy['Low'],
+    np.maximum(
+        abs(spy['High'] - spy['Close'].shift(1)),
+        abs(spy['Low'] - spy['Close'].shift(1))
+    )
+)
+spy['ATR_14'] = spy['TR'].rolling(14).mean()
+
+print(f"✅ Created {sum(['Vol' in col for col in spy.columns])} volatility features")
+
+# ============================================================================
+# 3. MEAN REVERSION SIGNALS
+# ============================================================================
+print("\n🎯 GENERATING MEAN REVERSION SIGNALS...")
+
+# Signal 1: Extreme volatility spike (Vol_Ratio > 2.0)
+spy['Signal_Vol_Spike'] = (spy['Vol_Ratio'] > 2.0).astype(int)
+
+# Signal 2: Bollinger Band squeeze expansion (BB width > 95th percentile)
+bb_width_95 = spy['BB_Width'].quantile(0.95)
+spy['Signal_BB_Expand'] = (spy['BB_Width'] > bb_width_95).astype(int)
+
+# Signal 3: High ATR relative to 20-day average
+spy['ATR_Ratio'] = spy['ATR_14'] / spy['ATR_14'].rolling(20).mean()
+spy['Signal_ATR_Spike'] = (spy['ATR_Ratio'] > 1.5).astype(int)
+
+# Signal 4: Volatility cluster (high vol for 3+ days)
+spy['High_Vol_Days'] = (spy['Vol_5d'] > spy['Vol_20d']).rolling(3).sum()
+spy['Signal_Vol_Cluster'] = (spy['High_Vol_Days'] >= 3).astype(int)
+
+print(f"✅ Generated {sum(['Signal_' in col for col in spy.columns])} signal types")
+
+# ============================================================================
+# 4. CONFIDENCE SCORING (YOUR EXPERTISE)
+# ============================================================================
+print("\n⚖️ BUILDING CONFIDENCE SCORING...")
+
+# Confidence component 1: Volatility extremity (0-30 points)
+spy['Conf_Vol_Extreme'] = 30 * ((spy['Vol_Ratio'] - 1) / 3).clip(0, 1)
+
+# Confidence component 2: Signal convergence (0-25 points)
+signal_sum = spy['Signal_Vol_Spike'] + spy['Signal_BB_Expand'] + spy['Signal_ATR_Spike'] + spy['Signal_Vol_Cluster']
+spy['Conf_Convergence'] = 25 * (signal_sum / 4)
+
+# Confidence component 3: Volume confirmation (0-20 points)
+spy['Volume_Ratio'] = spy['Volume'] / spy['Volume'].rolling(20).mean()
+spy['Conf_Volume'] = 20 * (spy['Volume_Ratio'] / 3).clip(0, 1)
+
+# Confidence component 4: Return extremity (0-15 points)
+# Extreme negative returns often precede mean reversion
+spy['Return_Extreme'] = abs(spy['Return'].rolling(5).sum())
+spy['Conf_Return'] = 15 * (spy['Return_Extreme'] / 0.10).clip(0, 1)  # Max at 10% move
+
+# Confidence component 5: Regime context (0-10 points) - using your old skill!
+# Negative skew often accompanies volatility extremes
+spy['Skew_21d'] = spy['Log_Return'].rolling(21).skew()
+spy['Conf_Skew'] = 10 * (abs(spy['Skew_21d']) / 2).clip(0, 1)  # More extreme skew = more confidence
+
+# Total confidence score
+spy['Confidence_Score'] = (
+    spy['Conf_Vol_Extreme'].fillna(0) +
+    spy['Conf_Convergence'].fillna(0) +
+    spy['Conf_Volume'].fillna(0) +
+    spy['Conf_Return'].fillna(0) +
+    spy['Conf_Skew'].fillna(0)
+).clip(0, 100)
+
+print(f"✅ Confidence scores range: {spy['Confidence_Score'].min():.1f} to {spy['Confidence_Score'].max():.1f}")
+
+# ============================================================================
+# 5. SIGNAL GENERATION
+# ============================================================================
+print("\n🔔 GENERATING TRADING SIGNALS...")
+
+# Base signal: Any volatility signal active
+spy['Signal_Base'] = (
+    (spy['Signal_Vol_Spike'] == 1) |
+    (spy['Signal_BB_Expand'] == 1) |
+    (spy['Signal_ATR_Spike'] == 1) |
+    (spy['Signal_Vol_Cluster'] == 1)
+).astype(int)
+
+# Tiered signals based on confidence
+confidence_thresholds = {
+    'Tier1': spy['Confidence_Score'].quantile(0.75),
+    'Tier2': spy['Confidence_Score'].quantile(0.50),
+    'Tier3': spy['Confidence_Score'].quantile(0.25)
+}
+
+spy['Signal_Tier1'] = ((spy['Signal_Base'] == 1) & 
+                       (spy['Confidence_Score'] >= confidence_thresholds['Tier1'])).astype(int)
+
+spy['Signal_Tier2'] = ((spy['Signal_Base'] == 1) & 
+                       (spy['Confidence_Score'] >= confidence_thresholds['Tier2']) &
+                       (spy['Confidence_Score'] < confidence_thresholds['Tier1'])).astype(int)
+
+spy['Signal_Tier3'] = ((spy['Signal_Base'] == 1) & 
+                       (spy['Confidence_Score'] < confidence_thresholds['Tier2'])).astype(int)
+
+print(f"\n📊 SIGNAL DISTRIBUTION:")
+print(f"• Tier 1 (High): {spy['Signal_Tier1'].sum()} signals")
+print(f"• Tier 2 (Medium): {spy['Signal_Tier2'].sum()} signals")
+print(f"• Tier 3 (Low): {spy['Signal_Tier3'].sum()} signals")
+print(f"• Total signals: {spy['Signal_Base'].sum()}")
+
+# ============================================================================
+# 6. BACKTEST SIMULATION (Simple)
+# ============================================================================
+print("\n💰 SIMPLE BACKTEST SIMULATION...")
+
+# Simulate mean reversion strategy: Buy after volatility spike, hold 5 days
+capital = 10000
+position = 0
+entry_price = 0
+trades = []
+equity_curve = [capital]
+
+for i in range(20, len(spy) - 5):  # Start after enough data for indicators
+    current_price = spy.iloc[i]['Close']
+    
+    # ENTRY: Signal with confidence > 50
+    if position == 0 and spy.iloc[i]['Signal_Base'] == 1 and spy.iloc[i]['Confidence_Score'] > 50:
+        # Size position based on confidence
+        confidence = spy.iloc[i]['Confidence_Score']
+        risk_pct = 0.01 + (confidence / 100) * 0.02  # 1-3% risk
+        
+        position = int((capital * risk_pct) / (current_price * 0.02))  # 2% stop loss
+        entry_price = current_price
+        entry_date = spy.index[i]
+        
+        trades.append({
+            'entry_date': entry_date,
+            'entry_price': entry_price,
+            'confidence': confidence,
+            'position': position
+        })
+    
+    # EXIT: 5 days later or stop loss
+    if position > 0 and i >= (trades[-1]['entry_date'] + pd.Timedelta(days=5)).astype(int):
+        exit_price = current_price
+        pnl = position * (exit_price - entry_price)
+        capital += pnl
+        
+        trades[-1]['exit_date'] = spy.index[i]
+        trades[-1]['exit_price'] = exit_price
+        trades[-1]['pnl'] = pnl
+        trades[-1]['hold_days'] = 5
+        
+        position = 0
+        entry_price = 0
+    
+    equity_curve.append(capital)
+
+print(f"\n📈 BACKTEST RESULTS:")
+print(f"• Starting capital: $10,000")
+print(f"• Final capital: ${capital:,.2f}")
+print(f"• Total return: {((capital/10000)-1)*100:.1f}%")
+print(f"• Total trades: {len(trades)}")
+
+if trades:
+    winning_trades = [t for t in trades if t.get('pnl', 0) > 0]
+    losing_trades = [t for t in trades if t.get('pnl', 0) <= 0]
+    
+    print(f"• Winning trades: {len(winning_trades)} ({len(winning_trades)/len(trades):.1%})")
+    print(f"• Losing trades: {len(losing_trades)}")
+    
+    if winning_trades:
+        avg_win = np.mean([t['pnl'] for t in winning_trades])
+        avg_loss = np.mean([t['pnl'] for t in losing_trades]) if losing_trades else 0
+        print(f"• Average win: ${avg_win:.2f}")
+        print(f"• Average loss: ${avg_loss:.2f}")
+
+# ============================================================================
+# 7. SIGNAL ANALYSIS
+# ============================================================================
+print("\n🔍 ANALYZING SIGNAL CHARACTERISTICS...")
+
+# Analyze recent signals
+recent_signals = spy.tail(20)
+has_signals = recent_signals[recent_signals['Signal_Base'] == 1]
+
+if len(has_signals) > 0:
+    print(f"\n📅 RECENT SIGNALS (Last 20 days):")
+    for date, row in has_signals.iterrows():
+        tier = "Tier1" if row['Signal_Tier1'] == 1 else "Tier2" if row['Signal_Tier2'] == 1 else "Tier3"
+        print(f"  {date.date()}: {tier} (Confidence: {row['Confidence_Score']:.1f}, Vol Ratio: {row['Vol_Ratio']:.2f})")
+
+# Check current market state
+last_row = spy.iloc[-1]
+print(f"\n📊 CURRENT MARKET STATE ({spy.index[-1].date()}):")
+print(f"• Volatility Ratio: {last_row['Vol_Ratio']:.2f}")
+print(f"• ATR Ratio: {last_row['ATR_Ratio']:.2f}")
+print(f"• BB Width Percentile: {(last_row['BB_Width'] > bb_width_95)*100:.0f}%")
+print(f"• Confidence Score: {last_row['Confidence_Score']:.1f}/100")
+print(f"• Signal Active: {'YES' if last_row['Signal_Base'] == 1 else 'NO'}")
+
+if last_row['Signal_Base'] == 1:
+    tier = "Tier1" if last_row['Signal_Tier1'] == 1 else "Tier2" if last_row['Signal_Tier2'] == 1 else "Tier3"
+    print(f"• Signal Tier: {tier}")
+    
+    # Trading recommendation
+    if last_row['Confidence_Score'] > 70:
+        print(f"\n🎯 TRADING RECOMMENDATION: STRONG SIGNAL - Consider mean reversion trade")
+        print(f"   • Position size: 2-3% risk")
+        print(f"   • Target: 5-day hold")
+        print(f"   • Stop loss: 2% below entry")
+    elif last_row['Confidence_Score'] > 50:
+        print(f"\n🎯 TRADING RECOMMENDATION: MODERATE SIGNAL - Watch for confirmation")
+        print(f"   • Position size: 1-2% risk")
+        print(f"   • Wait for next day confirmation")
+    else:
+        print(f"\n🎯 TRADING RECOMMENDATION: WEAK SIGNAL - Monitor only")
+        print(f"   • Position size: <1% risk if trading")
+
+# ============================================================================
+# 8. NEXT STEPS
+# ============================================================================
+print("\n" + "=" * 80)
+print("🚀 BARREL 1 COMPLETE - NEXT STEPS:")
+print("=" * 80)
+
+print("\n📋 WEEK 1 TASKS (Barrel 1 Refinement):")
+print("1. ✅ Basic volatility signals built")
+print("2. 🔄 Add more features (put/call ratio, VIX term structure)")
+print("3. 🔄 Improve exit rules (trailing stops, time-based exits)")
+print("4. 🔄 Full backtest 2010-2026")
+print("5. 🔄 Optimize confidence scoring weights")
+
+print("\n📋 WEEK 2 TASKS (Barrel 2 - QQQ Momentum Fade):")
+print("1. Start building QQQ momentum signals")
+print("2. Test correlation with SPY signals")
+print("3. Build combined portfolio logic")
+
+print("\n📋 WEEK 3 TASKS (Barrel 3 - IWM Washout):")
+print("1. Build IWM small-cap washout signals")
+print("2. Add volume surge detection")
+print("3. Test overnight edge")
+
+print("\n📋 WEEK 4 TASKS (Multi-Barrel Integration):")
+print("1. Combine all 3 barrels")
+print("2. Build risk manager (Kelly, correlation)")
+print("3. Paper trade simulation")
+
+print("\n" + "=" * 80)
+print("✅ BARREL 1: SPY VOLATILITY CRUSHER - READY FOR REFINEMENT")
+print("=" * 80)
