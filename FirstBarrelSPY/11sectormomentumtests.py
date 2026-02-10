@@ -189,6 +189,7 @@ sharesxlv = 0
 sharesxlf = 0
 portfoliob = []
 
+
 # Add transaction costs and slippage for benchmark
 benchmark_transaction_cost = cashb * TRANSACTION_COST * 3  # Buy 3 ETFs
 benchmark_slippage_cost = cashb * SLIPPAGE * 3  # Slippage on 3 purchases
@@ -311,3 +312,7 @@ if len(trades) > 0:
     if len(trades)/2 > breakeven_turnover:
         reduction_needed = ((len(trades)/2) - breakeven_turnover) / (len(trades)/2) * 100
         print(f"   Need to reduce turnover by {reduction_needed:.0f}%")
+
+#print dates
+for i in range(len(trades)):
+    print(f"{trades[i]['date'].date()} - {trades[i]['action']} {trades[i]['shares']:.2f} {trades[i]['sector']} at ${trades[i]['execution_price']:.2f} (cost: ${trades[i]['total_cost']:.2f})")
